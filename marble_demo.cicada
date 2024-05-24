@@ -1,0 +1,126 @@
+DEQs :: marble
+
+
+DEQs.generate( ; sampleInterval = 500;
+    
+    sampleImportanceF :: {
+        
+        cx :: cs :: numNextXY :: int
+        diff :: double
+        oneX :: [] { idx :: int, value :: double }
+        
+        code
+        
+        numNextXY = top(next_xy)
+        oneX[^numNextXY]
+        
+        args[1][] = 0
+        for cx in <1, numX>  (
+            for cs in <1, numNextXY>  (
+                oneX[cs].idx = cs
+                oneX[cs].value = next_xy[cs].x[cx]   )
+            sort(oneX, 2; direction = increasing)
+            
+            args[1][oneX[1].idx] = that + 1
+            args[1][oneX[top].idx] = that + 1
+            for cs in <2, numNextXY>  (
+                diff = oneX[cs].value - oneX[cs-1].value
+                if diff > 1  then diff = 1
+                args[1][oneX[cs-1].idx] = that + diff
+                args[1][oneX[cs].idx] = that + diff
+        )   )
+    }
+    
+    
+    xSizeF :: { ;  if level == 1  then return H.numVars,  else return floor(args[1]/2)  }
+    
+    
+    if level == 1  then H :: {
+        
+        numVars := 10
+        avNterms := 10
+        avNvarsPerTerm := 5
+        minPrefactor := 1.e-10
+        
+        x *:: [] double
+        xHistory *:: [][] double
+        gradH :: [] double
+        xy :: [] trainingSampleType
+        ct :: cv :: cTerm :: numTimeSteps :: int
+        dp :: dt :: t0 :: double
+        term :: { prefactor :: bias :: double, vars :: [] { varNo :: int, coef :: gradCoef :: double } }
+        terms :: {}
+        
+        terms[^0]
+        loop (
+            terms[+top+1] :: term
+            terms[top].prefactor = minPrefactor^random()
+            terms[top].bias = 2*random()-1
+            dp = 0
+            for cv in <1, numVars>  (
+            if random() < avNvarsPerTerm/numVars  then (
+                terms[top].vars[+top+1] = { cv-1, 2*random()-1, 2*random()-1 }
+                dp = that + terms[top].vars[top].coef * terms[top].vars[top].gradCoef
+            ))
+            if dp > 0  then (
+            backfor cTerm in <1, top(terms[top].vars)>  (
+                terms[top].vars[cTerm].gradCoef = -that
+            ))
+        ) until random() < 1/avNterms
+        
+        
+        code
+        
+        x = @args[1]
+        $H1(x, gradH, terms)
+        
+        return gradH
+        
+        
+        code
+        
+        { numTimeSteps, t0, dt } = { args[1], args[2], args[3] }
+        xHistory = @args[4]         | x[t][n]
+        xy = @args[5]               | saved {x,y} samples
+        
+        gradH[^numVars]
+        
+        $simH1(level, numTimeSteps, t0, dt, xy, gradH, xHistory, terms)
+        
+        return false
+    }
+    
+    
+    maxSamplesF :: { ;  return floor(10^5 / (numX*20))  }       | stay under 100 kB assuming 20-digit floating point numbers
+    
+    
+    ifCosmFinishedF :: { ;  return numX == 0  }
+    
+    
+    ifModelFinishedF :: {
+        
+        minSimsToUpscale := 30
+        
+        enoughSims :: bool
+        (simTrigger :: int) = minSimsToUpscale
+        
+        code
+        
+        enoughSims = (numSims >= simTrigger)
+        if enoughSims  then simTrigger = numSims + minSimsToUpscale
+        
+        return enoughSims
+    }
+    
+    
+    numTimeStepsF :: { ;  return 10000  }
+    
+    
+    stateInitF :: {  cx :: int;  for cx in <1, numX>  args[1][cx] = 2*random()-1  }
+    
+    
+    UD_encoderArgs :: { ; }
+    
+    
+    H_regressorArgs :: { ; }
+)

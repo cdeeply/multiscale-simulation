@@ -1,0 +1,288 @@
+run("CDNN")
+
+
+| cosm -- a generic class for multiscale models
+| * cosm(; code to set functions) -- init class
+| * cosm.generate(; set params; code to set functions) -- generate a multiscale model
+| * cosm.model[level].sim(# time steps; set params [; code to override stateInitF()]) -- run a simulation
+| 
+| internal:
+| * cosm.upscale(level; H/U/D = @...) to add higher-scale model built from Nvars variables,
+|       using time evolution H(t, {x,y}), upscaling operator U, downscaling operator D, and allocating up to maxSamples for training
+| * cosmNN.upscale(level; ; autoencoder (U/D) params; regressor (H) params)
+
+
+trainingSampleType *:: { x :: y :: [] double }
+
+
+cosm *:: {
+    
+    models :: {}
+    
+    T :: double
+    
+    modelType *:: {
+        
+        level :: int
+        
+        H :: *                          | time evolution
+        U :: D :: *                     | upscale/downscale operators
+        
+        sampleImportanceF :: *          | void(ranks)
+        ifCosmFinishedF :: *            | bool()
+        ifModelFinishedF :: *           | bool()
+        numTimeStepsF :: *              | int()
+        maxSamplesF :: *                | int()
+        stateInitF :: *                 | void(x[1])
+        xSizeF :: *                     | int(numX[level-1]) for cosmNN
+        
+        numX :: maxSamples :: numSims :: int
+        xy :: next_xy :: [] trainingSampleType
+        
+        
+        sim :: {
+            
+            numTsteps :: cs :: int
+            doDownscale :: bool
+            xHistory :: [][] double
+            params :: { saveSamples :: bool, sampleInterval :: int, dt :: double }
+            
+            code
+            
+            { numTsteps } = args
+            (params<<{ ; saveSamples = false, sampleInterval = 1, dt = 0.01  })()
+            (params<<args)()
+            
+            xHistory = @nothing
+            xHistory @:: [numTsteps+1][numX] double
+            
+            stateInitF(xHistory[1])
+            args#2(level, xHistory[1])                | give args#2() a chance to override stateInitF()
+            
+            doDownscale = H#2(numTsteps, T, params.dt, xHistory, xy)
+            if doDownscale  then return { true, D(xHistory[numTsteps]) }
+            
+            numSims = that + 1
+            if params.saveSamples  then (
+                cs = params.sampleInterval
+                while cs <= numTsteps  do (
+                    next_xy[+top+1] = {  xHistory[cs], xHistory[cs+1]  }
+                    cs = that + params.sampleInterval
+            )   )
+            
+            return { false, xHistory }
+        }
+        
+        
+        pruneSamples :: {
+            
+            ranks :: [] double
+            
+            code
+            
+            if top(next_xy) > maxSamples  then (
+                ranks[^top(next_xy)]
+                sampleImportanceF(ranks)
+                sort(next_xy, ranks; direction = decreasing)
+                next_xy[^maxSamples]
+            )
+        }
+        
+        
+        code
+        
+        level = args[1]
+printl("init model ", level)
+        
+        (this<<args)()
+        
+        numX = (this<<xSizeF)(
+            if level == 1  then this[^0]
+            else  models[level-1].numX       )
+        
+        maxSamples = maxSamplesF()
+        next_xy[^0].x[^numX], next_xy[].y[^numX]
+        
+        numSims = 0
+    }
+    
+    
+    addModel :: {
+        
+        aArgs :: *
+        
+        code
+        
+        aArgs = @args
+        
+        (models[+top+1] :: modelType)(top(models); (this<<aArgs)())         | must set numX, U() if level > 1
+        
+        aArgs = @nothing
+    }
+    
+    
+    generate :: {
+        
+        level :: int
+        gArgs :: rtrn :: *
+        
+        params :: {
+            fromScratch :: printStatus :: bool
+            sampleInterval :: int ;
+            
+            params.fromScratch = params.printStatus = true
+            sampleInterval = 1
+        }
+        
+        
+        code
+        
+        gArgs = @args
+        
+        T = 0
+        
+        params(), (params<<args)()
+        
+        if params.fromScratch  then parent()
+        
+        level = top(models)
+        rtrn = @nothing
+        loop  (
+            
+            if params.printStatus  then printl("[upscale]")
+            level = that + 1
+            addModel(; (this<<gArgs#2)())
+            
+            if params.printStatus  then print("sim ", level, ":  ")
+            while not models[level].ifModelFinishedF()  do (
+                
+                rtrn = @models[level].sim( models[level].numTimeStepsF();
+                        saveSamples = true, sampleInterval = params.sampleInterval)
+|                        ; if rtrn /= @nothing  then args[2] = rtrn        )
+                
+                if params.printStatus  then print("*")
+                models[level].pruneSamples()
+                if not rtrn[1]  then rtrn = @nothing          | ignore history
+                
+                if rtrn /= @nothing  then (
+                    level = that - 1
+                    models[^level]
+                    if params.printStatus  then print(" [downscale]\nsim ", level, ":  ")
+        )   )   )  until models[level].ifCosmFinishedF()
+        
+        rtrn = @gArgs = @nothing
+    }
+    
+    
+    code
+    
+    models[^0]
+}
+
+
+
+if trap(CDNN) == passed then &
+marble *:: cosm : {
+    
+    modelType *:: modelType : {
+        
+        U :: D :: CDNN      | : { ; return run(args[1]) }
+        UD_encoderArgs :: *
+        H_regressorArgs :: *
+    }
+    
+    
+    addModel :: addModel : {
+        
+        HtrainingSamples :: [][] double
+        yIdx :: [] int
+        cil :: cs :: numSamples :: layerOffset :: int
+        
+        code
+        
+        (models[top] << { ;
+            
+            if level == 1  then return
+            
+            
+                | build the up/downscaling NN
+            
+            U.getTabularEncoder(models[level-1].next_xy[].x, *, { numX, models[level-1].numX - numX };
+                    if UD_encoderArgs /= @nothing  then (this<<UD_encoderArgs)(),
+                    transpose = SAMPLE_FEATURE_ARRAY, doEncoder = doDecoder = true)
+            
+            
+                | split the autoencoder into separate en/decoders
+            
+            layerOffset = U.encoderLayer - 1
+            D.numLayers = U.numLayers - layerOffset
+            D.encoderLayer = -1
+            D.variationalLayer = U.variationalLayer - layerOffset
+            D.setupNN( ;
+                
+                layerSize[1] = 1, layerAFs[1] = 0, numLayerInputs[1] = 0
+                layerSize[<2, top>] = U.layerSize[<U.encoderLayer+1, top>]
+                layerAFs[<3, top>] = U.layerAFs[<U.encoderLayer+2, top>]
+                numLayerInputs[<3, top>] = U.numLayerInputs[<U.encoderLayer+2, top>] ;
+                
+                if args[1] > 2  then (
+                    weights[args[1]] = @U.weights[U.encoderLayer+args[1]-1]
+                    layerInputs[args[1]] = @U.layerInputs[U.encoderLayer+args[1]-1]
+                    for cil in <1, numLayerInputs[args[1]]>  (
+                    if layerInputs[args[1]][cil] > 0  then (
+                        layerInputs[args[1]][cil] = that - layerOffset
+            )   )   ))
+            D.Cptrs()
+            
+            U.numLayers = U.encoderLayer+1
+            U.encoderLayer = U.variationalLayer = -1
+            U.layerSize[^U.numLayers], U.layerAFs[^U.numLayers], U.numLayerInputs[^U.numLayers]
+            U.layerInputs[^U.numLayers], U.weights[^U.numLayers], U.y[^U.numLayers]
+            U.Cptrs()
+            
+            
+                | copy the training samples over into the new encoding space
+            
+            xy[].x[^numX], xy[].y[^numX]
+            xy[^numSamples = top(models[top-1].next_xy)]
+            for cs in <1, numSamples>  (
+                xy[cs].x = U(models[top-1].next_xy[cs].x)
+                xy[cs].y = U(models[top-1].next_xy[cs].y)
+            )
+            
+            HtrainingSamples[^0][^2*(numX = U.layerSize[top])], HtrainingSamples[^top(models[level-1].next_xy)]
+            HtrainingSamples =! xy
+            yIdx[^numX]
+            for cs in <1, numX>  yIdx[cs] = numX + cs
+            
+            
+                | build the time-evolution NN
+            
+            H :: CDNN : {
+                
+                numTimeSteps :: rtrn :: int
+                dt :: double
+                xHistory :: [][numX] double
+                xy :: [] trainingSampleType
+                
+                code
+                
+                code
+                
+                numTimeSteps = @args[1]
+                { T, dt } = { args[2], args[3] }
+                xHistory[^numTimeSteps]
+                xHistory = @args[4]
+                xy = @args[5]
+                
+                rtrn = $simCDNN(level, numTimeSteps, T, dt, xy, y[top], xHistory,
+                        numLayers, variationalLayer, layerSize, layerAFs, numLayerInputs, Cptrs.data, y, layerInputs, weights)
+                
+                return (rtrn /= 0)
+            }
+            
+            H.getTabularRegressor(HtrainingSamples, *, yIdx;
+                    if H_regressorArgs /= @nothing  then (this<<H_regressorArgs)(), transpose = SAMPLE_FEATURE_ARRAY)
+        })()
+    }
+}

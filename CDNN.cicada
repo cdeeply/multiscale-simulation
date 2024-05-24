@@ -1,0 +1,181 @@
+ptr :: [$ptrSize()] char
+
+
+CDNN :: {
+    
+    numLayers :: encoderLayer :: variationalLayer :: int
+    layerSize :: layerAFs :: numLayerInputs :: [] int
+    layerInputs :: weights :: {}
+    inputs :: [] double
+    y :: {}
+    
+    
+    Cptrs :: {
+        
+        layerInputs :: weights :: y :: [] ptr
+        layerWeights :: {}
+        cl :: int
+        data :: { y, layerInputs, weights, layerWeights }
+        
+        code
+        
+        layerInputs[^numLayers]
+        weights[^numLayers]
+        y[^numLayers]
+        
+        layerWeights[^0]
+        for cl in <1, numLayers>  layerWeights[cl] :: [numLayerInputs[cl]] ptr
+    }
+    
+    
+    setupNN :: {
+        
+        cl :: cil :: int
+        
+        code
+        
+        layerSize[^numLayers], layerAFs[^numLayers], numLayerInputs[^numLayers]
+        (parent<<args#1)()
+        
+        for cl in <1, numLayers>  (
+            layerInputs[cl] :: [numLayerInputs[cl]] int
+            weights[cl] :: {}
+            for cil in <1, numLayerInputs[cl]>  (
+                weights[cl][cil] :: [layerSize[cl]][layerSize[cil]] double
+            )
+            (parent<<args#2)(cl)
+            
+            y[cl] :: [layerSize[cl]] double
+        )
+        
+        inputs[^layerSize[2]]
+    }
+    
+    
+    getNN :: {
+        
+        numFeatures :: numSamples :: idx1 :: idx2 :: cl :: cil :: l :: l0 :: int
+        trainingSamples :: [][] double
+        importances :: *
+        noImportance :: [0] double
+        Cdata :: [$CDNNsize()] char
+        
+        params :: {
+            
+            transpose :: maxWeights :: maxHiddenNeurons :: maxLayers :: maxLayerSkips :: int
+            hasBias :: bool
+            
+            FEATURE_SAMPLE_ARRAY := 0, SAMPLE_FEATURE_ARRAY := 1
+            NO_MAX := -1
+            
+            code
+            
+            transpose = SAMPLE_FEATURE_ARRAY
+            maxWeights = maxHiddenNeurons = maxLayers = maxLayerSkips = NO_MAX
+            hasBias = true
+        }
+        
+        code
+        
+        idx1 = top(args[1])
+        if idx1 == 0  then idx2 = 0
+        else  idx2 = top(args[1][1])
+        
+        params(), (params<<args)()
+        
+        if params.transpose == params.FEATURE_SAMPLE_ARRAY  then { numFeatures, numSamples } = { idx1, idx2 }
+        else  { numFeatures, numSamples } = { idx2, idx1 } 
+        
+        trainingSamples[^0][^idx2], trainingSamples[^idx1]
+        trainingSamples = args[1]
+        importances = @args[2]
+        if importances == @nothing  then importances = @noImportance        | pass to C as an empty array
+        
+        
+        code
+        
+        $getNNdata1(Cdata, numLayers, encoderLayer, variationalLayer)
+        
+        setupNN( ;
+            $getNNdata2(Cdata, layerSize, layerAFs, numLayerInputs) ;
+            l = args[1]-1, $getNNdata3(Cdata, l, layerInputs[args[1]], weights[args[1]])    )
+        
+        Cptrs()
+        
+        $freeCDNN(Cdata)
+    }
+    
+    
+    getTabularRegressor :: getNN : {
+        
+        numInputs :: numOutputs :: co :: rtrn :: int
+        outputIndices :: [] int
+        
+        params :: params : {
+            
+            allowIOconnections :: bool
+            
+            NO_IO_CONNECTIONS := 0, ALLOW_IO_CONNECTIONS := 1
+            
+            code
+            
+            allowIOconnections = true
+        }
+        
+        code
+        
+        numOutputs = top(args[3])
+        outputIndices[^numOutputs]
+        for co in <1, numOutputs>  outputIndices[co] = args[3][co] - 1          | convert to C indexing
+        numInputs = numFeatures - numOutputs
+        
+        rtrn = $getTabularRegressor(Cdata, numInputs, numOutputs, numSamples, trainingSamples,
+                    params.transpose, outputIndices, importances,
+                    params.maxWeights, params.maxHiddenNeurons, params.maxLayers, params.maxLayerSkips,
+                    params.hasBias, params.allowIOconnections)
+        if rtrn /= passed  then return rtrn
+        
+        this#2()
+    }
+    
+    
+    getTabularEncoder :: getNN : {
+        
+        numEncodingFeatures :: numVariationalFeatures :: rtrn :: int
+        outputIndices :: [] int
+        
+        params :: params : {
+            
+            doEncoder :: doDecoder :: bool
+            variationalDist :: int
+            
+            UNIFORM_DIST := 0, NORMAL_DIST := 1
+            
+            code
+            
+            doEncoder = doDecoder = true
+            variationalDist = NORMAL_DIST
+        }
+        
+        code
+        
+        if trap(numEncodingFeatures = args[3]) == passed  then numVariationalFeatures = 0
+        else  { numEncodingFeatures, numVariationalFeatures } = args[3] 
+        
+        rtrn = $getTabularEncoder(Cdata, numFeatures, numSamples, trainingSamples, params.transpose, importances,
+                    params.doEncoder, params.doDecoder, numEncodingFeatures, numVariationalFeatures, params.variationalDist,
+                    params.maxWeights, params.maxHiddenNeurons, params.maxLayers, params.maxLayerSkips, params.hasBias)
+        if rtrn /= passed  then return rtrn
+        
+        this#2()
+    }
+    
+    
+    code
+    
+    inputs[^top(args[1])], inputs = args[1]
+    
+    $runCDNN(inputs, numLayers, variationalLayer, layerSize, layerAFs, numLayerInputs, Cptrs.data, y, layerInputs, weights)
+    
+    return y[top]
+}
